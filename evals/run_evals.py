@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -73,7 +74,7 @@ def main() -> int:
     result = subprocess.run(command, cwd=REPO_ROOT, env=env, text=True, capture_output=True)
     print(result.stdout, end="")
     if result.returncode:
-        print(result.stderr, end="", file=sys.stderr)
+        print(summarize_child_error(result.stderr), file=sys.stderr)
         return result.returncode
 
     report_path = output_dir / "anti_slop_report.json"
@@ -109,6 +110,27 @@ def load_env_file(path: Path, env: dict[str, str]) -> None:
         value = value.strip().strip('"').strip("'")
         if key:
             env[key] = value
+
+
+def summarize_child_error(stderr: str) -> str:
+    api_error = re.search(
+        r"(google\.genai\.errors\.ClientError|openai\.[A-Za-z.]+):\s*(.*)",
+        stderr,
+    )
+    if api_error:
+        detail = api_error.group(2).strip()
+        if "API_KEY_INVALID" in detail or "API Key not found" in detail:
+            return (
+                "Hosted eval failed: provider rejected the API key. "
+                "Set a valid GEMINI_API_KEY/GOOGLE_API_KEY or OPENAI_API_KEY in .env "
+                "or the shell and rerun the eval."
+            )
+        return f"Hosted eval failed: {api_error.group(1)}: {detail}"
+
+    lines = [line for line in stderr.strip().splitlines() if line.strip()]
+    if not lines:
+        return "Eval command failed without stderr output."
+    return "\n".join(lines[-8:])
 
 
 def evaluate_report(report: dict[str, Any], report_path: Path, html_path: Path) -> list[str]:
