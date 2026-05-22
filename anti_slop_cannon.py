@@ -189,7 +189,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("root", nargs="?", default=".", help="Codebase root to scan.")
     parser.add_argument(
         "--provider",
-        choices=("google", "openai", "sentence-transformers", "hash"),
+        choices=("google", "openai", "openrouter", "sentence-transformers", "hash"),
         default="google",
         help="Embedding backend. Use hash only for offline smoke tests.",
     )
@@ -198,8 +198,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Embedding model. Defaults to gemini-embedding-2 for Google, "
-            "text-embedding-3-large for OpenAI, Qwen/Qwen3-Embedding-8B "
-            "for sentence-transformers, or hash-ngram."
+            "text-embedding-3-large for OpenAI, openai/text-embedding-3-small "
+            "for OpenRouter, Qwen/Qwen3-Embedding-8B for sentence-transformers, "
+            "or hash-ngram."
         ),
     )
     parser.add_argument(
@@ -923,6 +924,34 @@ class OpenAIProvider(EmbeddingProvider):
         return [list(item.embedding) for item in sorted(response.data, key=lambda item: item.index)]
 
 
+class OpenRouterProvider(EmbeddingProvider):
+    provider_name = "openrouter"
+
+    def __init__(self, model: str, dims: int) -> None:
+        self.model = model
+        self.dims = dims
+
+    def cache_identity(self) -> str:
+        return f"openrouter:{self.model}:{self.dims}:clustering"
+
+    def embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise SystemExit("Missing dependency: install openai or run `pip install -e .`.") from exc
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise SystemExit("Set OPENROUTER_API_KEY, or use `--provider hash` for a smoke test.")
+        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+        response = client.embeddings.create(
+            model=self.model,
+            input=list(texts),
+            dimensions=self.dims,
+            encoding_format="float",
+        )
+        return [list(item.embedding) for item in sorted(response.data, key=lambda item: item.index)]
+
+
 class SentenceTransformerProvider(EmbeddingProvider):
     provider_name = "sentence-transformers"
 
@@ -967,6 +996,8 @@ def make_provider(args: argparse.Namespace) -> EmbeddingProvider:
         return GoogleProvider(args.model or "gemini-embedding-2", dims, args.sleep)
     if args.provider == "openai":
         return OpenAIProvider(args.model or "text-embedding-3-large", dims)
+    if args.provider == "openrouter":
+        return OpenRouterProvider(args.model or "openai/text-embedding-3-small", dims)
     if args.provider == "sentence-transformers":
         return SentenceTransformerProvider(args.model or "Qwen/Qwen3-Embedding-8B", dims)
     return HashNgramProvider(dims)
@@ -983,6 +1014,10 @@ def resolve_output_dim(args: argparse.Namespace) -> int:
             return 2560
         if "Qwen3-Embedding-0.6B" in model:
             return 1024
+    if args.provider == "openrouter":
+        model = args.model or "openai/text-embedding-3-small"
+        if model.endswith("text-embedding-3-small"):
+            return 1536
     return 3072
 
 

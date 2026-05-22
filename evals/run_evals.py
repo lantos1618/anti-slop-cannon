@@ -21,7 +21,11 @@ DEFAULT_SLOP_DIR = REPO_ROOT / "evals" / "slop_examples"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Anti-Slop Cannon fixture evals.")
-    parser.add_argument("--provider", default="hash", choices=("hash", "google", "openai", "sentence-transformers"))
+    parser.add_argument(
+        "--provider",
+        default="hash",
+        choices=("hash", "google", "openai", "openrouter", "sentence-transformers"),
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--output-dim", default=None, type=int)
     parser.add_argument("--root", default=str(DEFAULT_FIXTURE_ROOT))
@@ -119,11 +123,16 @@ def summarize_child_error(stderr: str) -> str:
     )
     if api_error:
         detail = api_error.group(2).strip()
-        if "API_KEY_INVALID" in detail or "API Key not found" in detail:
+        if (
+            "API_KEY_INVALID" in detail
+            or "API Key not found" in detail
+            or "User not found" in detail
+            or "401" in detail
+        ):
             return (
                 "Hosted eval failed: provider rejected the API key. "
-                "Set a valid GEMINI_API_KEY/GOOGLE_API_KEY or OPENAI_API_KEY in .env "
-                "or the shell and rerun the eval."
+                "Set a valid GEMINI_API_KEY/GOOGLE_API_KEY, OPENAI_API_KEY, "
+                "or OPENROUTER_API_KEY in .env or the shell and rerun the eval."
             )
         return f"Hosted eval failed: {api_error.group(1)}: {detail}"
 

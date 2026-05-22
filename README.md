@@ -79,6 +79,16 @@ anti-slop-cannon /path/to/code \
   --output-dim 3072
 ```
 
+For OpenRouter embeddings:
+
+```bash
+export OPENROUTER_API_KEY=...
+anti-slop-cannon /path/to/code \
+  --provider openrouter \
+  --model openai/text-embedding-3-small \
+  --output-dim 1536
+```
+
 For a no-API smoke test:
 
 ```bash
@@ -169,6 +179,7 @@ loads `.env` and does not print key values.
 ```bash
 GEMINI_API_KEY=... python evals/run_evals.py --provider google --keep-output
 OPENAI_API_KEY=... python evals/run_evals.py --provider openai --keep-output
+OPENROUTER_API_KEY=... python evals/run_evals.py --provider openrouter --keep-output
 ```
 
 The eval fixture expects the cannon to find a duplicated `parse_total_rows`
