@@ -185,3 +185,40 @@ OPENROUTER_API_KEY=... python evals/run_evals.py --provider openrouter --keep-ou
 The eval fixture expects the cannon to find a duplicated `parse_total_rows`
 implementation, produce at least one cluster, and match the supplied slop example
 against both duplicated files.
+
+Current fixture result with the offline hash provider:
+
+| Metric | Result |
+| --- | ---: |
+| Known duplicate pair recall | `1/1` |
+| Slop target file recall | `2/2` |
+| Files scanned | `4` |
+| Items analyzed | `10` |
+| Clusters found | `2` |
+| Slop matches | `4` |
+| Exact edges | `1` |
+| Near edges | `1` |
+| Semantic edges | `5` |
+
+Smoke scans on five real repositories from `lantos1618` and `lambda-run` produced:
+
+| Repo | Files | Items | Clusters | Clustered Items | Exact | Near | Semantic |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `better-ui` | 159 | 1134 | 91 | 64.5% | 67 | 47 | 4657 |
+| `lambda-run/deploy.me` | 144 | 905 | 64 | 37.3% | 9 | 127 | 1223 |
+| `arxiv.gg` | 68 | 343 | 31 | 30.6% | 3 | 1 | 101 |
+| `sumup-rs` | 47 | 272 | 16 | 66.5% | 154 | 3 | 542 |
+| `deploy-me-sdk` | 12 | 43 | 2 | 25.6% | 0 | 0 | 20 |
+| **Total** | **430** | **2697** | **204** | **50.6%** | **233** | **178** | **6543** |
+
+Representative high-confidence findings:
+
+- `lambda-run/deploy.me`: exact duplicate `eurPerHour` helpers across catalog providers
+- `lambda-run/deploy.me`: exact duplicate `useMe` page helpers in dashboard/providers pages
+- `better-ui`: exact duplicate demo route helpers across Next.js and Vite examples
+- `sumup-rs`: repeated `response` boilerplate across resource modules
+- `arxiv.gg`: exact duplicate template blocks and near-duplicate migration helpers
+
+The real-repo smoke scans used `--provider hash`, so exact and near-duplicate counts
+are the strongest evidence. Semantic edges are review leads; hosted embeddings should
+improve semantic quality once a valid provider key is available.
