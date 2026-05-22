@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from collections import Counter
 import hashlib
 import html
 import json
@@ -14,7 +16,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -109,6 +111,25 @@ class FileDoc:
     sha256: str
     extension: str
     text: str
+    imports: list[str]
+    calls: list[str]
+
+
+@dataclass
+class SemanticItem:
+    id: str
+    path: str
+    kind: str
+    name: str
+    start_line: int
+    end_line: int
+    size: int
+    sha256: str
+    normalized_hash: str
+    extension: str
+    text: str
+    imports: list[str]
+    calls: list[str]
 
 
 @dataclass
@@ -116,14 +137,24 @@ class SimilarPair:
     a: str
     b: str
     similarity: float
+    relation: str = "semantic"
+    evidence: str = ""
 
 
 @dataclass
 class Cluster:
     id: int
+    label: str
+    items: list[str]
     files: list[str]
     density: float
     max_similarity: float
+    semantic_edges: int
+    exact_edges: int
+    near_edges: int
+    shared_imports: list[str]
+    shared_calls: list[str]
+    recommendation: str
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -133,7 +164,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("root", nargs="?", default=".", help="Codebase root to scan.")
     parser.add_argument(
         "--provider",
-        choices=("google", "sentence-transformers", "hash"),
+        choices=("google", "openai", "sentence-transformers", "hash"),
         default="google",
         help="Embedding backend. Use hash only for offline smoke tests.",
     )
@@ -142,20 +173,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Embedding model. Defaults to gemini-embedding-2 for Google, "
-            "Qwen/Qwen3-Embedding-0.6B for sentence-transformers, or hash-ngram."
+            "text-embedding-3-large for OpenAI, Qwen/Qwen3-Embedding-8B "
+            "for sentence-transformers, or hash-ngram."
         ),
     )
     parser.add_argument(
         "--output-dim",
         type=int,
-        default=768,
+        default=None,
         help="Embedding dimensions to request/use when the provider supports it.",
+    )
+    parser.add_argument(
+        "--granularity",
+        choices=("file", "symbol", "both"),
+        default="symbol",
+        help="Embed whole files, extracted symbols/chunks, or both.",
     )
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.80,
+        default=0.82,
         help="Cosine similarity cutoff for cluster edges.",
+    )
+    parser.add_argument(
+        "--near-duplicate-threshold",
+        type=float,
+        default=0.86,
+        help="Token-overlap cutoff for near-duplicate edges.",
     )
     parser.add_argument(
         "--output-dir",
@@ -178,6 +222,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=20_000,
         help="Truncate each file to this many decoded characters before embedding.",
+    )
+    parser.add_argument(
+        "--min-symbol-lines",
+        type=int,
+        default=4,
+        help="Skip extracted symbols smaller than this many lines.",
+    )
+    parser.add_argument(
+        "--min-symbol-chars",
+        type=int,
+        default=160,
+        help="Skip extracted symbols smaller than this many characters.",
+    )
+    parser.add_argument(
+        "--chunk-lines",
+        type=int,
+        default=160,
+        help="Fallback line-window size for files where symbols cannot be extracted.",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=24,
+        help="Fallback line-window overlap.",
     )
     parser.add_argument(
         "--extensions",
@@ -205,6 +273,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=40,
         help="Number of high-similarity pairs to show in CLI output and HTML.",
+    )
+    parser.add_argument(
+        "--llm-labels",
+        action="store_true",
+        help="Use an LLM to label clusters and propose review actions. Falls back to heuristics.",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        choices=("google", "openai"),
+        default="google",
+        help="Provider for optional cluster labels.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Model for optional cluster labels. Defaults to gemini-2.5-flash or gpt-5-mini.",
     )
     return parser.parse_args(argv)
 
@@ -254,6 +338,61 @@ def should_skip_path(path: Path, root: Path, include_hidden: bool) -> bool:
     return False
 
 
+def summarize_structure(text: str, extension: str) -> tuple[list[str], list[str]]:
+    if extension == ".py":
+        return summarize_python_structure(text)
+    return summarize_text_structure(text)
+
+
+def summarize_python_structure(text: str) -> tuple[list[str], list[str]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return summarize_text_structure(text)
+
+    imports: set[str] = set()
+    calls: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".")[0] for alias in node.names if alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imports.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call):
+            name = call_name(node.func)
+            if name:
+                calls.add(name)
+    return sorted(imports)[:80], sorted(calls)[:120]
+
+
+def call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = call_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return ""
+
+
+def summarize_text_structure(text: str) -> tuple[list[str], list[str]]:
+    imports = set()
+    calls = set()
+    for match in re.finditer(
+        r"""(?mx)
+        ^\s*(?:import|from|require\(|use\s+|using\s+|\#include)\s+
+        ["'<]?
+        ([A-Za-z0-9_./:@-]+)
+        """,
+        text,
+    ):
+        imports.add(match.group(1).split("/")[0].split(".")[0])
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_$.]{2,})\s*\(", text):
+        name = match.group(1)
+        if name not in {"if", "for", "while", "switch", "catch", "return"}:
+            calls.add(name)
+    return sorted(imports)[:80], sorted(calls)[:120]
+
+
 def scan_files(args: argparse.Namespace) -> list[FileDoc]:
     root = Path(args.root).expanduser().resolve()
     extensions = normalize_extension_filter(args.extensions)
@@ -283,6 +422,7 @@ def scan_files(args: argparse.Namespace) -> list[FileDoc]:
 
         rel = path.relative_to(root).as_posix()
         text = data.decode("utf-8", errors="replace")
+        imports, calls = summarize_structure(text, path.suffix.lower())
         if len(text) > args.max_chars:
             text = text[: args.max_chars]
         docs.append(
@@ -292,18 +432,199 @@ def scan_files(args: argparse.Namespace) -> list[FileDoc]:
                 sha256=sha256_bytes(data),
                 extension=path.suffix.lower(),
                 text=text,
+                imports=imports,
+                calls=calls,
             )
         )
     return docs
 
 
-def embedding_text(doc: FileDoc) -> str:
+def normalized_source_hash(text: str) -> str:
+    normalized_lines = []
+    in_block_comment = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if in_block_comment:
+            if "*/" in line:
+                in_block_comment = False
+                line = line.split("*/", 1)[1].strip()
+            else:
+                continue
+        if line.startswith("/*"):
+            in_block_comment = "*/" not in line
+            continue
+        if line.startswith(("#", "//", "--", "*")):
+            continue
+        line = re.sub(r"\s+", " ", line)
+        normalized_lines.append(line)
+    return sha256_text("\n".join(normalized_lines))
+
+
+def item_label(item: SemanticItem) -> str:
+    if item.kind == "file":
+        return item.path
+    suffix = f":{item.start_line}-{item.end_line}" if item.start_line else ""
+    return f"{item.path}::{item.kind}:{item.name}{suffix}"
+
+
+def embedding_text(item: SemanticItem) -> str:
     return (
         "File path: {path}\n"
-        "File extension: {extension}\n"
-        "Purpose: identify implementation responsibility, behavior, and overlap.\n\n"
+        "Item kind: {kind}\n"
+        "Item name: {name}\n"
+        "Line range: {start_line}-{end_line}\n"
+        "Imports: {imports}\n"
+        "Calls: {calls}\n"
+        "Purpose: identify implementation responsibility, behavior, duplication, and overlap.\n\n"
         "{text}"
-    ).format(path=doc.path, extension=doc.extension or "none", text=doc.text)
+    ).format(
+        path=item.path,
+        kind=item.kind,
+        name=item.name or "(none)",
+        start_line=item.start_line,
+        end_line=item.end_line,
+        imports=", ".join(item.imports[:25]) or "(none)",
+        calls=", ".join(item.calls[:35]) or "(none)",
+        text=item.text,
+    )
+
+
+def build_semantic_items(docs: Sequence[FileDoc], args: argparse.Namespace) -> list[SemanticItem]:
+    items: list[SemanticItem] = []
+    for doc in docs:
+        if args.granularity in {"file", "both"}:
+            items.append(make_item(doc, "file", Path(doc.path).stem, 1, line_count(doc.text), doc.text))
+        if args.granularity in {"symbol", "both"}:
+            symbols = extract_symbols(doc, args)
+            if not symbols:
+                symbols = fallback_chunks(doc, args)
+            items.extend(symbols)
+    return items
+
+
+def make_item(
+    doc: FileDoc, kind: str, name: str, start_line: int, end_line: int, text: str
+) -> SemanticItem:
+    item_id = doc.path if kind == "file" else f"{doc.path}::{kind}:{name}:{start_line}-{end_line}"
+    encoded = text.encode("utf-8", errors="replace")
+    return SemanticItem(
+        id=item_id,
+        path=doc.path,
+        kind=kind,
+        name=name,
+        start_line=start_line,
+        end_line=end_line,
+        size=len(encoded),
+        sha256=sha256_bytes(encoded),
+        normalized_hash=normalized_source_hash(text),
+        extension=doc.extension,
+        text=text,
+        imports=doc.imports,
+        calls=doc.calls,
+    )
+
+
+def line_count(text: str) -> int:
+    return max(1, text.count("\n") + 1)
+
+
+def extract_symbols(doc: FileDoc, args: argparse.Namespace) -> list[SemanticItem]:
+    if doc.extension == ".py":
+        return extract_python_symbols(doc, args)
+    return extract_regex_symbols(doc, args)
+
+
+def extract_python_symbols(doc: FileDoc, args: argparse.Namespace) -> list[SemanticItem]:
+    try:
+        tree = ast.parse(doc.text)
+    except SyntaxError:
+        return []
+    lines = doc.text.splitlines()
+    items: list[SemanticItem] = []
+
+    def visit_body(body: Sequence[ast.stmt], parents: tuple[str, ...]) -> None:
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                add_node(node, "class", parents)
+                visit_body(node.body, parents + (node.name,))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                kind = "method" if parents else "function"
+                add_node(node, kind, parents)
+                visit_body(node.body, parents + (node.name,))
+
+    def add_node(node: ast.AST, kind: str, parents: tuple[str, ...]) -> None:
+        start = getattr(node, "lineno", 1)
+        end = getattr(node, "end_lineno", start)
+        if end - start + 1 < args.min_symbol_lines:
+            return
+        snippet = "\n".join(lines[start - 1 : end])
+        if len(snippet.strip()) < args.min_symbol_chars:
+            return
+        name = ".".join(parents + (getattr(node, "name", "symbol"),))
+        items.append(make_item(doc, kind, name, start, end, snippet))
+
+    visit_body(tree.body, ())
+    return items
+
+
+def extract_regex_symbols(doc: FileDoc, args: argparse.Namespace) -> list[SemanticItem]:
+    lines = doc.text.splitlines()
+    candidates: list[tuple[int, str, str]] = []
+    patterns = [
+        (r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(", "function"),
+        (r"^\s*(?:export\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b", "class"),
+        (r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?\(?", "function"),
+        (r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(?:async\s*)?\(?[^=]*=>", "function"),
+        (r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", "function"),
+        (r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:async\s+)?[A-Za-z0-9_<>,\[\]?]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", "function"),
+    ]
+    for index, line in enumerate(lines, start=1):
+        for pattern, kind in patterns:
+            match = re.match(pattern, line)
+            if match:
+                candidates.append((index, kind, match.group(1)))
+                break
+
+    items: list[SemanticItem] = []
+    for idx, (start, kind, name) in enumerate(candidates):
+        next_start = candidates[idx + 1][0] if idx + 1 < len(candidates) else len(lines) + 1
+        end = min(next_start - 1, start + args.chunk_lines - 1)
+        snippet = "\n".join(lines[start - 1 : end])
+        if end - start + 1 < args.min_symbol_lines or len(snippet.strip()) < args.min_symbol_chars:
+            continue
+        items.append(make_item(doc, kind, name, start, end, snippet))
+    return items
+
+
+def fallback_chunks(doc: FileDoc, args: argparse.Namespace) -> list[SemanticItem]:
+    lines = doc.text.splitlines()
+    if not lines:
+        return []
+    if len(lines) <= args.chunk_lines:
+        return [make_item(doc, "chunk", Path(doc.path).stem, 1, len(lines), doc.text)]
+    step = max(1, args.chunk_lines - args.chunk_overlap)
+    items: list[SemanticItem] = []
+    chunk_id = 1
+    for start_idx in range(0, len(lines), step):
+        end_idx = min(len(lines), start_idx + args.chunk_lines)
+        snippet = "\n".join(lines[start_idx:end_idx])
+        if len(snippet.strip()) >= args.min_symbol_chars:
+            items.append(
+                make_item(
+                    doc,
+                    "chunk",
+                    f"{Path(doc.path).stem}-{chunk_id}",
+                    start_idx + 1,
+                    end_idx,
+                    snippet,
+                )
+            )
+            chunk_id += 1
+        if end_idx == len(lines):
+            break
+    return items
 
 
 class EmbeddingProvider:
@@ -394,6 +715,33 @@ class GoogleProvider(EmbeddingProvider):
         return text
 
 
+class OpenAIProvider(EmbeddingProvider):
+    provider_name = "openai"
+
+    def __init__(self, model: str, dims: int) -> None:
+        self.model = model
+        self.dims = dims
+
+    def cache_identity(self) -> str:
+        return f"openai:{self.model}:{self.dims}:clustering"
+
+    def embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise SystemExit("Missing dependency: install openai or run `pip install -e .`.") from exc
+        if not os.getenv("OPENAI_API_KEY"):
+            raise SystemExit("Set OPENAI_API_KEY, or use `--provider hash` for a smoke test.")
+        client = OpenAI()
+        response = client.embeddings.create(
+            model=self.model,
+            input=list(texts),
+            dimensions=self.dims,
+            encoding_format="float",
+        )
+        return [list(item.embedding) for item in sorted(response.data, key=lambda item: item.index)]
+
+
 class SentenceTransformerProvider(EmbeddingProvider):
     provider_name = "sentence-transformers"
 
@@ -433,13 +781,28 @@ class SentenceTransformerProvider(EmbeddingProvider):
 
 
 def make_provider(args: argparse.Namespace) -> EmbeddingProvider:
+    dims = resolve_output_dim(args)
     if args.provider == "google":
-        return GoogleProvider(args.model or "gemini-embedding-2", args.output_dim, args.sleep)
+        return GoogleProvider(args.model or "gemini-embedding-2", dims, args.sleep)
+    if args.provider == "openai":
+        return OpenAIProvider(args.model or "text-embedding-3-large", dims)
     if args.provider == "sentence-transformers":
-        return SentenceTransformerProvider(
-            args.model or "Qwen/Qwen3-Embedding-0.6B", args.output_dim
-        )
-    return HashNgramProvider(args.output_dim)
+        return SentenceTransformerProvider(args.model or "Qwen/Qwen3-Embedding-8B", dims)
+    return HashNgramProvider(dims)
+
+
+def resolve_output_dim(args: argparse.Namespace) -> int:
+    if args.output_dim:
+        return args.output_dim
+    if args.provider == "sentence-transformers":
+        model = args.model or "Qwen/Qwen3-Embedding-8B"
+        if "Qwen3-Embedding-8B" in model:
+            return 4096
+        if "Qwen3-Embedding-4B" in model:
+            return 2560
+        if "Qwen3-Embedding-0.6B" in model:
+            return 1024
+    return 3072
 
 
 def resolve_cache_path(root: Path, value: str) -> Path:
@@ -464,7 +827,7 @@ def save_cache(path: Path, cache: dict[str, object]) -> None:
 
 
 def get_embeddings(
-    docs: Sequence[FileDoc], provider: EmbeddingProvider, args: argparse.Namespace
+    docs: Sequence[SemanticItem], provider: EmbeddingProvider, args: argparse.Namespace
 ) -> np.ndarray:
     root = Path(args.root).expanduser().resolve()
     cache_path = resolve_cache_path(root, args.cache_path)
@@ -477,7 +840,8 @@ def get_embeddings(
             json.dumps(
                 {
                     "provider": provider.cache_identity(),
-                    "file_sha256": doc.sha256,
+                    "item_sha256": doc.sha256,
+                    "item_id": doc.id,
                     "text_sha256": sha256_text(text),
                 },
                 sort_keys=True,
@@ -526,32 +890,152 @@ def normalize_matrix(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def cosine_pairs(docs: Sequence[FileDoc], embeddings: np.ndarray) -> tuple[np.ndarray, list[SimilarPair]]:
+def cosine_pairs(docs: Sequence[SemanticItem], embeddings: np.ndarray) -> tuple[np.ndarray, list[SimilarPair]]:
     similarity = embeddings @ embeddings.T
     pairs: list[SimilarPair] = []
     for i in range(len(docs)):
         for j in range(i + 1, len(docs)):
+            if redundant_parent_pair(docs[i], docs[j]):
+                continue
             pairs.append(
                 SimilarPair(
-                    a=docs[i].path,
-                    b=docs[j].path,
+                    a=docs[i].id,
+                    b=docs[j].id,
                     similarity=float(similarity[i, j]),
+                    relation="semantic",
+                    evidence="embedding cosine similarity",
                 )
             )
     pairs.sort(key=lambda pair: pair.similarity, reverse=True)
     return similarity, pairs
 
 
+def duplicate_pairs(docs: Sequence[SemanticItem], threshold: float) -> list[SimilarPair]:
+    pairs: list[SimilarPair] = []
+    hash_groups: dict[str, list[SemanticItem]] = {}
+    for doc in docs:
+        if doc.normalized_hash:
+            hash_groups.setdefault(doc.normalized_hash, []).append(doc)
+    seen: set[tuple[str, str, str]] = set()
+    for group in hash_groups.values():
+        if len(group) < 2:
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                if redundant_parent_pair(group[i], group[j]):
+                    continue
+                key = pair_key(group[i].id, group[j].id, "exact")
+                seen.add(key)
+                pairs.append(
+                    SimilarPair(
+                        a=group[i].id,
+                        b=group[j].id,
+                        similarity=1.0,
+                        relation="exact",
+                        evidence="same normalized source hash",
+                    )
+                )
+
+    token_sets = [token_set(doc.text) for doc in docs]
+    for i in range(len(docs)):
+        if len(token_sets[i]) < 18:
+            continue
+        for j in range(i + 1, len(docs)):
+            if redundant_parent_pair(docs[i], docs[j]):
+                continue
+            if len(token_sets[j]) < 18:
+                continue
+            key = pair_key(docs[i].id, docs[j].id, "near")
+            if key in seen:
+                continue
+            score = jaccard(token_sets[i], token_sets[j])
+            if score >= threshold:
+                pairs.append(
+                    SimilarPair(
+                        a=docs[i].id,
+                        b=docs[j].id,
+                        similarity=score,
+                        relation="near",
+                        evidence="high token-set overlap",
+                    )
+                )
+    pairs.sort(key=lambda pair: (pair.relation == "exact", pair.similarity), reverse=True)
+    return pairs
+
+
+def redundant_parent_pair(a: SemanticItem, b: SemanticItem) -> bool:
+    if a.path != b.path:
+        return False
+    if a.kind == "file" or b.kind == "file":
+        return True
+    a_contains_b = a.start_line <= b.start_line and a.end_line >= b.end_line
+    b_contains_a = b.start_line <= a.start_line and b.end_line >= a.end_line
+    return a_contains_b or b_contains_a
+
+
+def token_set(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}|[0-9]{2,}", text.lower())
+        if token not in {"the", "and", "for", "with", "from", "return", "const", "class", "function"}
+    }
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def pair_key(a: str, b: str, relation: str) -> tuple[str, str, str]:
+    first, second = sorted((a, b))
+    return first, second, relation
+
+
+def merge_pairs(semantic_pairs: Sequence[SimilarPair], duplicate_edges: Sequence[SimilarPair]) -> list[SimilarPair]:
+    merged: dict[tuple[str, str, str], SimilarPair] = {}
+    for pair in list(semantic_pairs) + list(duplicate_edges):
+        key = pair_key(pair.a, pair.b, pair.relation)
+        existing = merged.get(key)
+        if existing is None or pair.similarity > existing.similarity:
+            merged[key] = pair
+    pairs = list(merged.values())
+    pairs.sort(key=lambda pair: pair_sort_key(pair), reverse=True)
+    return pairs
+
+
+def pair_sort_key(pair: SimilarPair) -> tuple[int, float]:
+    priority = {"exact": 3, "near": 2, "semantic": 1}.get(pair.relation, 0)
+    return priority, pair.similarity
+
+
 def build_clusters(
-    docs: Sequence[FileDoc], similarity: np.ndarray, threshold: float
+    docs: Sequence[SemanticItem],
+    semantic_pairs: Sequence[SimilarPair],
+    duplicate_edges: Sequence[SimilarPair],
+    threshold: float,
 ) -> list[Cluster]:
     n = len(docs)
+    index_by_id = {doc.id: index for index, doc in enumerate(docs)}
     adjacency = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if similarity[i, j] >= threshold:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
+    edge_by_pair: dict[tuple[str, str], list[SimilarPair]] = {}
+
+    def add_edge(pair: SimilarPair) -> None:
+        if pair.a == pair.b:
+            return
+        if pair.a not in index_by_id or pair.b not in index_by_id:
+            return
+        i, j = index_by_id[pair.a], index_by_id[pair.b]
+        adjacency[i].append(j)
+        adjacency[j].append(i)
+        key = tuple(sorted((pair.a, pair.b)))
+        edge_by_pair.setdefault(key, []).append(pair)
+
+    for pair in semantic_pairs:
+        if pair.similarity >= threshold:
+            add_edge(pair)
+    for pair in duplicate_edges:
+        add_edge(pair)
 
     seen = set()
     clusters: list[Cluster] = []
@@ -570,19 +1054,36 @@ def build_clusters(
                     stack.append(neighbor)
         if len(component) < 2:
             continue
-        sims = [
-            float(similarity[i, j])
-            for offset, i in enumerate(component)
-            for j in component[offset + 1 :]
+        component_ids = {docs[index].id for index in component}
+        edges = [
+            edge
+            for ids, pair_edges in edge_by_pair.items()
+            if ids[0] in component_ids and ids[1] in component_ids
+            for edge in pair_edges
         ]
-        above = [value for value in sims if value >= threshold]
+        sims = [edge.similarity for edge in edges]
         possible_edges = len(component) * (len(component) - 1) / 2
+        component_items = [docs[i] for i in sorted(component, key=lambda idx: item_label(docs[idx]))]
+        relation_counts = Counter(edge.relation for edge in edges)
+        shared_imports = shared_terms([item.imports for item in component_items], 8)
+        shared_calls = shared_terms([item.calls for item in component_items], 10)
+        label = heuristic_cluster_label(component_items, shared_imports, shared_calls)
         clusters.append(
             Cluster(
                 id=len(clusters) + 1,
-                files=[docs[i].path for i in sorted(component, key=lambda idx: docs[idx].path)],
-                density=len(above) / possible_edges if possible_edges else 0.0,
+                label=label,
+                items=[item.id for item in component_items],
+                files=sorted({item.path for item in component_items}),
+                density=len({tuple(sorted((edge.a, edge.b))) for edge in edges}) / possible_edges
+                if possible_edges
+                else 0.0,
                 max_similarity=max(sims) if sims else 0.0,
+                semantic_edges=relation_counts.get("semantic", 0),
+                exact_edges=relation_counts.get("exact", 0),
+                near_edges=relation_counts.get("near", 0),
+                shared_imports=shared_imports,
+                shared_calls=shared_calls,
+                recommendation=review_recommendation(relation_counts, component_items),
             )
         )
 
@@ -590,6 +1091,63 @@ def build_clusters(
     for index, cluster in enumerate(clusters, start=1):
         cluster.id = index
     return clusters
+
+
+def shared_terms(term_lists: Sequence[Sequence[str]], limit: int) -> list[str]:
+    if len(term_lists) < 2:
+        return []
+    counter: Counter[str] = Counter()
+    for terms in term_lists:
+        counter.update(set(terms))
+    min_count = max(2, math.ceil(len(term_lists) * 0.4))
+    return [term for term, count in counter.most_common() if count >= min_count][:limit]
+
+
+def heuristic_cluster_label(
+    items: Sequence[SemanticItem], shared_imports: Sequence[str], shared_calls: Sequence[str]
+) -> str:
+    names = []
+    for item in items:
+        names.extend(split_name(item.name))
+        names.extend(split_name(Path(item.path).stem))
+    noise = {"test", "spec", "index", "main", "utils", "helper", "helpers", "file", "chunk"}
+    common = [word for word, _ in Counter(word for word in names if word not in noise).most_common(4)]
+    if common:
+        return " ".join(common).title()
+    if shared_imports:
+        return f"{shared_imports[0]} related code"
+    if shared_calls:
+        return f"{shared_calls[0]} call pattern"
+    parent = common_parent([item.path for item in items])
+    return parent or "Related implementation"
+
+
+def split_name(value: str) -> list[str]:
+    parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value).replace("_", " ").replace("-", " ")
+    return [part.lower() for part in re.findall(r"[A-Za-z0-9]{3,}", parts)]
+
+
+def common_parent(paths: Sequence[str]) -> str:
+    if not paths:
+        return ""
+    split_paths = [Path(path).parts[:-1] for path in paths]
+    shared = []
+    for parts in zip(*split_paths):
+        if len(set(parts)) == 1:
+            shared.append(parts[0])
+        else:
+            break
+    return "/".join(shared)
+
+
+def review_recommendation(counts: Counter[str], items: Sequence[SemanticItem]) -> str:
+    if counts.get("exact", 0):
+        return "Review exact normalized duplicates first; one implementation may be removable after checking callers and tests."
+    if counts.get("near", 0):
+        return "Review near-duplicate items for extracted shared helpers or a single canonical implementation."
+    if len({item.path for item in items}) == 1:
+        return "Related symbols live in the same file; inspect for local factoring before moving code."
+    return "Review the shared imports/calls and responsibilities before consolidating; semantic similarity alone is advisory."
 
 
 def pca_2d(embeddings: np.ndarray) -> np.ndarray:
@@ -611,15 +1169,16 @@ def pca_2d(embeddings: np.ndarray) -> np.ndarray:
 def cluster_lookup(clusters: Sequence[Cluster]) -> dict[str, int]:
     lookup: dict[str, int] = {}
     for cluster in clusters:
-        for file_path in cluster.files:
-            lookup[file_path] = cluster.id
+        for item_id in cluster.items:
+            lookup[item_id] = cluster.id
     return lookup
 
 
 def write_report(
     output_dir: Path,
     root: Path,
-    docs: Sequence[FileDoc],
+    files: Sequence[FileDoc],
+    docs: Sequence[SemanticItem],
     provider: EmbeddingProvider,
     args: argparse.Namespace,
     pairs: Sequence[SimilarPair],
@@ -632,8 +1191,11 @@ def write_report(
     report = {
         "root": str(root),
         "provider": provider.cache_identity(),
+        "granularity": args.granularity,
         "threshold": args.threshold,
-        "file_count": len(docs),
+        "near_duplicate_threshold": args.near_duplicate_threshold,
+        "file_count": len(files),
+        "item_count": len(docs),
         "cluster_count": len(clusters),
         "files": [
             {
@@ -641,13 +1203,34 @@ def write_report(
                 "size": doc.size,
                 "sha256": doc.sha256,
                 "extension": doc.extension,
-                "cluster_id": clustered.get(doc.path),
+            }
+            for doc in files
+        ],
+        "items": [
+            {
+                "id": doc.id,
+                "path": doc.path,
+                "kind": doc.kind,
+                "name": doc.name,
+                "start_line": doc.start_line,
+                "end_line": doc.end_line,
+                "size": doc.size,
+                "sha256": doc.sha256,
+                "normalized_hash": doc.normalized_hash,
+                "extension": doc.extension,
+                "imports": doc.imports,
+                "calls": doc.calls,
+                "cluster_id": clustered.get(doc.id),
                 "x": float(coords[index, 0]) if len(coords) else 0.0,
                 "y": float(coords[index, 1]) if len(coords) else 0.0,
             }
             for index, doc in enumerate(docs)
         ],
-        "similar_pairs": [asdict(pair) for pair in pairs if pair.similarity >= args.threshold],
+        "cluster_edges": [
+            asdict(pair)
+            for pair in pairs
+            if pair.relation != "semantic" or pair.similarity >= args.threshold
+        ],
         "top_pairs": [asdict(pair) for pair in pairs[: args.top_pairs]],
         "clusters": [asdict(cluster) for cluster in clusters],
     }
@@ -675,7 +1258,8 @@ def scale_coords(coords: np.ndarray, width: int, height: int) -> list[tuple[floa
 def write_html(
     output_dir: Path,
     root: Path,
-    docs: Sequence[FileDoc],
+    files: Sequence[FileDoc],
+    docs: Sequence[SemanticItem],
     provider: EmbeddingProvider,
     args: argparse.Namespace,
     pairs: Sequence[SimilarPair],
@@ -687,16 +1271,19 @@ def write_html(
     width, height = 1120, 760
     points = scale_coords(coords, width, height)
     clustered = cluster_lookup(clusters)
-    point_by_path = {doc.path: points[index] for index, doc in enumerate(docs)}
+    point_by_id = {doc.id: points[index] for index, doc in enumerate(docs)}
 
     edge_lines = []
-    for pair in [pair for pair in pairs if pair.similarity >= args.threshold][:160]:
-        x1, y1 = point_by_path[pair.a]
-        x2, y2 = point_by_path[pair.b]
+    for pair in [
+        pair for pair in pairs if pair.relation != "semantic" or pair.similarity >= args.threshold
+    ][:180]:
+        x1, y1 = point_by_id[pair.a]
+        x2, y2 = point_by_id[pair.b]
         width_px = 1 + max(0, pair.similarity - args.threshold) * 10
+        color = "#ef4444" if pair.relation == "exact" else "#f97316" if pair.relation == "near" else "#94a3b8"
         edge_lines.append(
             f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
-            f'stroke="#94a3b8" stroke-width="{width_px:.2f}" stroke-opacity="0.48" />'
+            f'stroke="{color}" stroke-width="{width_px:.2f}" stroke-opacity="0.50" />'
         )
 
     circles = []
@@ -704,9 +1291,10 @@ def write_html(
     for index, doc in enumerate(docs):
         x, y = points[index]
         cid = clustered.get(doc.path, 0)
+        cid = clustered.get(doc.id, 0)
         color = COLORS[(cid - 1) % len(COLORS)] if cid else "#64748b"
-        radius = 7 if cid else 5
-        escaped_path = html.escape(doc.path)
+        radius = 8 if doc.kind == "file" else 6 if cid else 4
+        escaped_path = html.escape(item_label(doc))
         circles.append(
             f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius}" fill="{color}" '
             f'stroke="#0f172a" stroke-width="1"><title>{escaped_path}</title></circle>'
@@ -719,12 +1307,22 @@ def write_html(
 
     cluster_sections = []
     for cluster in clusters:
-        items = "\n".join(f"<li>{html.escape(path)}</li>" for path in cluster.files)
+        item_rows = "\n".join(f"<li>{html.escape(item_id)}</li>" for item_id in cluster.items)
+        shared = []
+        if cluster.shared_imports:
+            shared.append(f"<p>Shared imports: <code>{html.escape(', '.join(cluster.shared_imports))}</code></p>")
+        if cluster.shared_calls:
+            shared.append(f"<p>Shared calls: <code>{html.escape(', '.join(cluster.shared_calls))}</code></p>")
         cluster_sections.append(
             "<section>"
-            f"<h3>Cluster {cluster.id}: {len(cluster.files)} files, "
-            f"max similarity {cluster.max_similarity:.3f}, density {cluster.density:.2f}</h3>"
-            f"<ul>{items}</ul>"
+            f"<h3>Cluster {cluster.id}: {html.escape(cluster.label)}</h3>"
+            f"<p>{len(cluster.items)} items across {len(cluster.files)} files. "
+            f"Edges: {cluster.semantic_edges} semantic, {cluster.near_edges} near, "
+            f"{cluster.exact_edges} exact. Max score {cluster.max_similarity:.3f}, "
+            f"density {cluster.density:.2f}.</p>"
+            f"<p>{html.escape(cluster.recommendation)}</p>"
+            f"{''.join(shared)}"
+            f"<ul>{item_rows}</ul>"
             "</section>"
         )
 
@@ -734,7 +1332,7 @@ def write_html(
         top_pair_rows.append(
             "<tr>"
             f"<td>{pair.similarity:.3f}</td>"
-            f"<td>{marker}</td>"
+            f"<td>{html.escape(pair.relation)} {marker}</td>"
             f"<td>{html.escape(pair.a)}</td>"
             f"<td>{html.escape(pair.b)}</td>"
             "</tr>"
@@ -872,10 +1470,11 @@ def write_html(
   </header>
   <main>
     <div class="stats">
-      <div class="stat"><strong>{len(docs)}</strong><span>files embedded</span></div>
+      <div class="stat"><strong>{len(files)}</strong><span>files scanned</span></div>
+      <div class="stat"><strong>{len(docs)}</strong><span>items embedded</span></div>
       <div class="stat"><strong>{len(clusters)}</strong><span>clusters above threshold</span></div>
       <div class="stat"><strong>{args.threshold:.2f}</strong><span>similarity threshold</span></div>
-      <div class="stat"><strong>{sum(1 for pair in pairs if pair.similarity >= args.threshold)}</strong><span>overlap edges</span></div>
+      <div class="stat"><strong>{sum(1 for pair in pairs if pair.relation != 'semantic' or pair.similarity >= args.threshold)}</strong><span>overlap edges</span></div>
     </div>
     <h2>Map</h2>
     <div class="map">
@@ -905,8 +1504,111 @@ def write_html(
     return html_path
 
 
+def maybe_label_clusters_with_llm(
+    clusters: Sequence[Cluster], docs: Sequence[SemanticItem], args: argparse.Namespace
+) -> None:
+    if not args.llm_labels or not clusters:
+        return
+    items_by_id = {doc.id: doc for doc in docs}
+    for cluster in clusters:
+        sample_items = [items_by_id[item_id] for item_id in cluster.items if item_id in items_by_id][:8]
+        prompt = cluster_label_prompt(cluster, sample_items)
+        try:
+            label, recommendation = request_cluster_label(prompt, args)
+        except Exception as exc:  # noqa: BLE001 - labeling is advisory and should not break analysis.
+            print(f"LLM label fallback for cluster {cluster.id}: {exc}", file=sys.stderr)
+            continue
+        if label:
+            cluster.label = label[:90]
+        if recommendation:
+            cluster.recommendation = recommendation[:240]
+
+
+def cluster_label_prompt(cluster: Cluster, items: Sequence[SemanticItem]) -> str:
+    item_summaries = []
+    for item in items:
+        snippet = "\n".join(item.text.strip().splitlines()[:30])
+        item_summaries.append(
+            {
+                "id": item.id,
+                "kind": item.kind,
+                "imports": item.imports[:12],
+                "calls": item.calls[:18],
+                "snippet": snippet[:1800],
+            }
+        )
+    return (
+        "You label code-overlap clusters. Return only JSON with keys label and recommendation. "
+        "The recommendation must be cautious and review-oriented, never telling the user to delete "
+        "code without checking callers and tests.\n\n"
+        + json.dumps(
+            {
+                "cluster_id": cluster.id,
+                "current_label": cluster.label,
+                "edge_counts": {
+                    "semantic": cluster.semantic_edges,
+                    "near": cluster.near_edges,
+                    "exact": cluster.exact_edges,
+                },
+                "shared_imports": cluster.shared_imports,
+                "shared_calls": cluster.shared_calls,
+                "items": item_summaries,
+            },
+            indent=2,
+        )
+    )
+
+
+def request_cluster_label(prompt: str, args: argparse.Namespace) -> tuple[str, str]:
+    if args.llm_provider == "google":
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise RuntimeError("install google-genai for Google LLM labels") from exc
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+            raise RuntimeError("set GEMINI_API_KEY or GOOGLE_API_KEY for Google LLM labels")
+        client = genai.Client()
+        response = client.models.generate_content(
+            model=args.llm_model or "gemini-2.5-flash",
+            contents=prompt,
+        )
+        text = getattr(response, "text", "") or ""
+    else:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError("install openai for OpenAI LLM labels") from exc
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("set OPENAI_API_KEY for OpenAI LLM labels")
+        client = OpenAI()
+        response = client.responses.create(
+            model=args.llm_model or "gpt-5-mini",
+            input=prompt,
+        )
+        text = getattr(response, "output_text", "") or ""
+    payload = parse_json_object(text)
+    return str(payload.get("label", "")), str(payload.get("recommendation", ""))
+
+
+def parse_json_object(text: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def print_summary(
-    docs: Sequence[FileDoc],
+    files: Sequence[FileDoc],
+    docs: Sequence[SemanticItem],
     pairs: Sequence[SimilarPair],
     clusters: Sequence[Cluster],
     args: argparse.Namespace,
@@ -914,7 +1616,8 @@ def print_summary(
     html_path: Path,
 ) -> None:
     print()
-    print(f"Embedded files: {len(docs)}")
+    print(f"Scanned files: {len(files)}")
+    print(f"Embedded items: {len(docs)}")
     print(f"Clusters above {args.threshold:.2f}: {len(clusters)}")
     print(f"Report: {report_path}")
     print(f"Map: {html_path}")
@@ -922,18 +1625,18 @@ def print_summary(
         print()
         print("Largest clusters:")
         for cluster in clusters[:5]:
-            preview = ", ".join(cluster.files[:4])
-            if len(cluster.files) > 4:
+            preview = ", ".join(cluster.items[:4])
+            if len(cluster.items) > 4:
                 preview += ", ..."
             print(
-                f"  {cluster.id}. {len(cluster.files)} files, "
+                f"  {cluster.id}. {cluster.label}: {len(cluster.items)} items, "
                 f"max={cluster.max_similarity:.3f}: {preview}"
             )
     if pairs:
         print()
         print("Top pairs:")
         for pair in pairs[: min(args.top_pairs, 10)]:
-            print(f"  {pair.similarity:.3f}  {pair.a}  <->  {pair.b}")
+            print(f"  {pair.relation:8} {pair.similarity:.3f}  {pair.a}  <->  {pair.b}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -945,26 +1648,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 0 <= args.threshold <= 1:
         print("--threshold must be between 0 and 1", file=sys.stderr)
         return 2
+    if not 0 <= args.near_duplicate_threshold <= 1:
+        print("--near-duplicate-threshold must be between 0 and 1", file=sys.stderr)
+        return 2
 
     provider = make_provider(args)
-    docs = scan_files(args)
-    if not docs:
+    files = scan_files(args)
+    if not files:
         print("No eligible text/code files found.", file=sys.stderr)
+        return 1
+    docs = build_semantic_items(files, args)
+    if not docs:
+        print("No eligible files, symbols, or chunks found.", file=sys.stderr)
         return 1
 
     print(f"Scanning root: {root}")
-    print(f"Eligible files: {len(docs)}")
+    print(f"Eligible files: {len(files)}")
+    print(f"Embedding granularity: {args.granularity} ({len(docs)} items)")
     embeddings = get_embeddings(docs, provider, args)
-    similarity, pairs = cosine_pairs(docs, embeddings)
-    clusters = build_clusters(docs, similarity, args.threshold)
+    _, semantic_pairs = cosine_pairs(docs, embeddings)
+    duplicate_edges = duplicate_pairs(docs, args.near_duplicate_threshold)
+    pairs = merge_pairs(semantic_pairs, duplicate_edges)
+    clusters = build_clusters(docs, semantic_pairs, duplicate_edges, args.threshold)
+    maybe_label_clusters_with_llm(clusters, docs, args)
     coords = pca_2d(embeddings)
     output_dir = Path(args.output_dir).expanduser().resolve()
-    report_path = write_report(output_dir, root, docs, provider, args, pairs, clusters, coords)
-    html_path = write_html(output_dir, root, docs, provider, args, pairs, clusters, coords)
-    print_summary(docs, pairs, clusters, args, report_path, html_path)
+    report_path = write_report(output_dir, root, files, docs, provider, args, pairs, clusters, coords)
+    html_path = write_html(output_dir, root, files, docs, provider, args, pairs, clusters, coords)
+    print_summary(files, docs, pairs, clusters, args, report_path, html_path)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
