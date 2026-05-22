@@ -189,9 +189,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("root", nargs="?", default=".", help="Codebase root to scan.")
     parser.add_argument(
         "--provider",
-        choices=("google", "openai", "openrouter", "sentence-transformers", "hash"),
-        default="google",
-        help="Embedding backend. Use hash only for offline smoke tests.",
+        choices=("auto", "google", "openai", "openrouter", "sentence-transformers", "hash"),
+        default="auto",
+        help=(
+            "Embedding backend. auto uses an available hosted API key, otherwise hash. "
+            "Use an explicit provider to fail hard instead of falling back."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -229,13 +232,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=".",
-        help="Directory for anti_slop_report.json and anti_slop_map.html.",
+        default=None,
+        help=(
+            "Directory for anti_slop_report.json and anti_slop_map.html. "
+            "Defaults to .anti-slop-out/<target> under the current directory."
+        ),
     )
     parser.add_argument(
         "--cache-path",
-        default=".anti-slop-cache/embeddings.json",
-        help="Embedding cache path, relative to the scanned root unless absolute.",
+        default=None,
+        help=(
+            "Embedding cache path, relative to the scanned root unless absolute. "
+            "Defaults to <output-dir>/embeddings.json."
+        ),
     )
     parser.add_argument(
         "--max-file-bytes",
@@ -252,7 +261,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-items",
         type=int,
-        default=0,
+        default=1200,
         help="Maximum analysis items to embed after extraction. Use 0 for no cap.",
     )
     parser.add_argument(
@@ -1015,22 +1024,37 @@ class SentenceTransformerProvider(EmbeddingProvider):
 
 
 def make_provider(args: argparse.Namespace) -> EmbeddingProvider:
-    dims = resolve_output_dim(args)
-    if args.provider == "google":
+    provider_name = resolve_provider_name(args)
+    args.resolved_provider = provider_name
+    dims = resolve_output_dim(args, provider_name)
+    if provider_name == "google":
         return GoogleProvider(args.model or "gemini-embedding-2", dims, args.sleep)
-    if args.provider == "openai":
+    if provider_name == "openai":
         return OpenAIProvider(args.model or "text-embedding-3-large", dims)
-    if args.provider == "openrouter":
+    if provider_name == "openrouter":
         return OpenRouterProvider(args.model or "openai/text-embedding-3-small", dims)
-    if args.provider == "sentence-transformers":
+    if provider_name == "sentence-transformers":
         return SentenceTransformerProvider(args.model or "Qwen/Qwen3-Embedding-8B", dims)
     return HashNgramProvider(dims)
 
 
-def resolve_output_dim(args: argparse.Namespace) -> int:
+def resolve_provider_name(args: argparse.Namespace) -> str:
+    if args.provider != "auto":
+        return args.provider
+    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        return "google"
+    if os.getenv("OPENAI_API_KEY"):
+        return "openai"
+    if os.getenv("OPENROUTER_API_KEY"):
+        return "openrouter"
+    return "hash"
+
+
+def resolve_output_dim(args: argparse.Namespace, provider_name: str | None = None) -> int:
     if args.output_dim:
         return args.output_dim
-    if args.provider == "sentence-transformers":
+    provider_name = provider_name or getattr(args, "resolved_provider", args.provider)
+    if provider_name == "sentence-transformers":
         model = args.model or "Qwen/Qwen3-Embedding-8B"
         if "Qwen3-Embedding-8B" in model:
             return 4096
@@ -1038,14 +1062,29 @@ def resolve_output_dim(args: argparse.Namespace) -> int:
             return 2560
         if "Qwen3-Embedding-0.6B" in model:
             return 1024
-    if args.provider == "openrouter":
+    if provider_name == "openrouter":
         model = args.model or "openai/text-embedding-3-small"
         if model.endswith("text-embedding-3-small"):
             return 1536
     return 3072
 
 
-def resolve_cache_path(root: Path, value: str) -> Path:
+def default_output_dir(root: Path) -> Path:
+    label = root.name or "scan"
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip(".-") or "scan"
+    digest = hashlib.sha256(root.as_posix().encode("utf-8")).hexdigest()[:8]
+    return Path.cwd() / ".anti-slop-out" / f"{slug}-{digest}"
+
+
+def resolve_output_dir(root: Path, value: str | None) -> Path:
+    if not value:
+        return default_output_dir(root).resolve()
+    return Path(value).expanduser().resolve()
+
+
+def resolve_cache_path(root: Path, value: str | None, output_dir: Path) -> Path:
+    if not value:
+        return output_dir / "embeddings.json"
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
@@ -1067,10 +1106,13 @@ def save_cache(path: Path, cache: dict[str, object]) -> None:
 
 
 def get_embeddings(
-    docs: Sequence[SemanticItem], provider: EmbeddingProvider, args: argparse.Namespace
+    docs: Sequence[SemanticItem],
+    provider: EmbeddingProvider,
+    args: argparse.Namespace,
+    output_dir: Path,
 ) -> np.ndarray:
     root = Path(args.root).expanduser().resolve()
-    cache_path = resolve_cache_path(root, args.cache_path)
+    cache_path = resolve_cache_path(root, args.cache_path, output_dir)
     cache = {"version": 1, "entries": {}} if args.no_cache else load_cache(cache_path)
     entries: dict[str, object] = cache.setdefault("entries", {})  # type: ignore[assignment]
 
@@ -1102,7 +1144,7 @@ def get_embeddings(
 
     if misses:
         missing_texts = [texts[i] for i in misses]
-        print(f"Embedding {len(misses)} uncached file(s) with {provider.cache_identity()}...")
+        print(f"Embedding {len(misses)} uncached file(s) with {provider.cache_identity()}...", flush=True)
         embedded = provider.embed_many(missing_texts)
         for idx, vector in zip(misses, embedded):
             normalized = normalize_vector(np.array(vector, dtype=np.float64)).tolist()
@@ -1111,7 +1153,7 @@ def get_embeddings(
         if not args.no_cache:
             save_cache(cache_path, cache)
     else:
-        print(f"Loaded {len(vectors)} embedding(s) from cache.")
+        print(f"Loaded {len(vectors)} embedding(s) from cache.", flush=True)
 
     matrix = np.array(vectors, dtype=np.float64)
     return normalize_matrix(matrix)
@@ -2083,6 +2125,35 @@ def print_summary(
             print(f"  {pair.relation:8} {pair.similarity:.3f}  {pair.a}  <->  {pair.b}")
 
 
+def short_exception(exc: Exception) -> str:
+    message = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+    if len(message) > 180:
+        message = f"{message[:177]}..."
+    return f"{exc.__class__.__name__}: {message}"
+
+
+def get_embeddings_with_auto_fallback(
+    docs: Sequence[SemanticItem],
+    provider: EmbeddingProvider,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> tuple[np.ndarray, EmbeddingProvider]:
+    try:
+        return get_embeddings(docs, provider, args, output_dir), provider
+    except Exception as exc:
+        if args.provider != "auto" or provider.provider_name == "hash":
+            raise
+        print(
+            (
+                f"Auto provider {provider.cache_identity()} failed "
+                f"({short_exception(exc)}); falling back to hash."
+            ),
+            file=sys.stderr,
+        )
+        fallback = HashNgramProvider(resolve_output_dim(args, "hash"))
+        return get_embeddings(docs, fallback, args, output_dir), fallback
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     root = Path(args.root).expanduser().resolve()
@@ -2111,6 +2182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("--slop-top-matches must be zero or greater", file=sys.stderr)
         return 2
 
+    output_dir = resolve_output_dir(root, args.output_dir)
     provider = make_provider(args)
     files = scan_files(args)
     if not files:
@@ -2128,11 +2200,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     slop_items = build_slop_example_items(slop_examples)
 
     print(f"Scanning root: {root}")
+    if args.provider == "auto":
+        print(f"Provider: auto -> {provider.cache_identity()}")
+    else:
+        print(f"Provider: {provider.cache_identity()}")
     print(f"Eligible files: {len(files)}")
     print(f"Embedding granularity: {args.granularity} ({len(docs)} items)")
     if slop_examples:
         print(f"Slop examples: {len(slop_examples)}")
-    all_embeddings = get_embeddings([*docs, *slop_items], provider, args)
+    sys.stdout.flush()
+    initial_provider = provider.cache_identity()
+    all_embeddings, provider = get_embeddings_with_auto_fallback(
+        [*docs, *slop_items],
+        provider,
+        args,
+        output_dir,
+    )
+    if provider.cache_identity() != initial_provider:
+        print(f"Provider: fallback -> {provider.cache_identity()}")
     embeddings = all_embeddings[: len(docs)]
     slop_embeddings = all_embeddings[len(docs) :]
     semantic_pairs, semantic_stats = cosine_pairs(docs, embeddings, args.threshold, args.top_pairs)
@@ -2159,7 +2244,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     maybe_label_clusters_with_llm(clusters, docs, args)
     coords = pca_2d(embeddings)
-    output_dir = Path(args.output_dir).expanduser().resolve()
     report_path = write_report(
         output_dir,
         root,

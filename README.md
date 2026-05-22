@@ -12,7 +12,7 @@ optionally matches supplied slop examples against the codebase, and writes:
 
 ## Model Choice
 
-Default hosted model: `gemini-embedding-2`.
+Default hosted model when `auto` selects Google: `gemini-embedding-2`.
 
 There is no current OpenAI `text-embedding-4` in the official OpenAI docs, and the
 current Gemini docs do not list a Gemini "embedding 4" model. For hosted SOA, use
@@ -48,6 +48,16 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
+
+Default run:
+
+```bash
+anti-slop-cannon /path/to/code
+```
+
+The default provider is `auto`: it uses Google, OpenAI, or OpenRouter when the
+matching API key is present, and otherwise falls back to the offline `hash` provider.
+Reports are written to `.anti-slop-out/<target>/` under the current directory.
 
 For Google embeddings:
 
@@ -92,7 +102,7 @@ anti-slop-cannon /path/to/code \
 For a no-API smoke test:
 
 ```bash
-anti-slop-cannon . --provider hash --output-dir .anti-slop-out
+anti-slop-cannon . --provider hash
 ```
 
 The hash provider is only a cheap lexical fallback. It is useful for checking the
@@ -101,15 +111,12 @@ pipeline, but it is not a replacement for semantic embeddings.
 ## Usage
 
 ```bash
-anti-slop-cannon /path/to/code \
-  --provider google \
-  --model gemini-embedding-2 \
-  --output-dim 3072 \
-  --granularity symbol \
-  --threshold 0.82 \
-  --near-duplicate-threshold 0.86 \
-  --output-dir anti-slop-output
+anti-slop-cannon /path/to/code
 ```
+
+That command scans symbols/chunks, caps the first pass at 1200 analysis items, writes
+`anti_slop_report.json` plus `anti_slop_map.html`, and reuses cached embeddings on
+later runs.
 
 Run with examples of slop you already know about:
 
@@ -148,6 +155,7 @@ Useful flags:
 - `--threshold`: similarity cutoff for duplicate/overlap edges
 - `--near-duplicate-threshold`: token-overlap cutoff for near-duplicate evidence
 - `--granularity`: `symbol` for functions/classes/chunks, `file` for whole files, `both` for comparison
+- `--provider`: `auto` by default; pass `google`, `openai`, `openrouter`, `sentence-transformers`, or `hash` to force one backend
 - `--slop-example`: literal text or a file path to match against the codebase
 - `--slop-examples-dir`: directory of example snippets/files to match against the codebase
 - `--slop-match-threshold`: similarity cutoff for example-to-code matches
@@ -159,17 +167,18 @@ Useful flags:
 - `--chunk-lines`, `--chunk-overlap`: control fallback chunks
 - `--max-file-bytes`: skip files above this size
 - `--max-chars`: truncate each file before embedding
-- `--max-items`: cap extracted items for very large or exploratory scans
+- `--max-items`: cap extracted items for very large or exploratory scans; default is `1200`, use `0` for no cap
 - `--include-hidden`: include hidden files/directories
 - `--extensions`: comma-separated extension allowlist, for example `.py,.ts,.tsx,.md`
-- `--cache-path`: reuse unchanged embeddings across runs
+- `--output-dir`: defaults to `.anti-slop-out/<target>/` under the current directory
+- `--cache-path`: reuse unchanged embeddings across runs; defaults to `<output-dir>/embeddings.json`
 
 Open the generated `anti_slop_map.html` in a browser. Dense clusters and high-similarity
 pairs are the first places to inspect for repeated responsibilities, duplicated
 implementations, and files that may want consolidation.
 
-For large repos, start with `--granularity symbol`, keep generated/vendor directories
-excluded, and use `--max-items` for an exploratory first pass. Tune
+For large repos, start with the default symbol scan, keep generated/vendor directories
+excluded, and use `--max-items 0` only when you want a full pass. Tune
 `--max-near-candidates-per-item` downward if the near-duplicate pass is still too broad.
 The JSON report includes `analysis_stats` and `scan_limits` so scan cost and candidate
 pruning are visible.
