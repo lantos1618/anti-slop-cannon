@@ -142,6 +142,31 @@ class SimilarPair:
 
 
 @dataclass
+class SlopExample:
+    id: str
+    name: str
+    source: str
+    size: int
+    sha256: str
+    text: str
+
+
+@dataclass
+class SlopMatch:
+    example_id: str
+    example_name: str
+    item_id: str
+    path: str
+    kind: str
+    name: str
+    start_line: int
+    end_line: int
+    similarity: float
+    relation: str
+    evidence: str
+
+
+@dataclass
 class Cluster:
     id: int
     label: str
@@ -273,6 +298,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=40,
         help="Number of high-similarity pairs to show in CLI output and HTML.",
+    )
+    parser.add_argument(
+        "--slop-example",
+        action="append",
+        default=[],
+        metavar="TEXT_OR_PATH",
+        help="Slop example as literal text or a file path. Repeat for multiple examples.",
+    )
+    parser.add_argument(
+        "--slop-examples-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Directory of slop example files to match against the scanned codebase.",
+    )
+    parser.add_argument(
+        "--slop-match-threshold",
+        type=float,
+        default=0.74,
+        help="Cosine similarity cutoff for example-to-code slop matches.",
+    )
+    parser.add_argument(
+        "--slop-top-matches",
+        type=int,
+        default=50,
+        help="Maximum slop example matches to write and print. Use 0 for all matches.",
     )
     parser.add_argument(
         "--llm-labels",
@@ -439,6 +490,133 @@ def scan_files(args: argparse.Namespace) -> list[FileDoc]:
     return docs
 
 
+def load_slop_examples(args: argparse.Namespace, root: Path) -> list[SlopExample]:
+    examples: list[SlopExample] = []
+    for value in args.slop_example:
+        path = resolve_existing_input_path(value, root)
+        if path and path.is_file():
+            example = read_slop_example_file(path, len(examples) + 1, args)
+            if example:
+                examples.append(example)
+        elif path and path.is_dir():
+            examples.extend(read_slop_example_dir(path, args, len(examples) + 1))
+        else:
+            text = str(value).strip()
+            if text:
+                examples.append(make_literal_slop_example(text, len(examples) + 1))
+
+    for value in args.slop_examples_dir:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            cwd_candidate = Path.cwd() / path
+            root_candidate = root / path
+            path = cwd_candidate if cwd_candidate.exists() else root_candidate
+        if not path.exists() or not path.is_dir():
+            print(f"Skipping missing slop examples dir: {value}", file=sys.stderr)
+            continue
+        examples.extend(read_slop_example_dir(path.resolve(), args, len(examples) + 1))
+
+    seen_hashes: set[str] = set()
+    unique: list[SlopExample] = []
+    for example in examples:
+        if example.sha256 in seen_hashes:
+            continue
+        seen_hashes.add(example.sha256)
+        unique.append(example)
+    return unique
+
+
+def resolve_existing_input_path(value: str, root: Path) -> Path | None:
+    path = Path(value).expanduser()
+    candidates = [path] if path.is_absolute() else [Path.cwd() / path, root / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def read_slop_example_dir(path: Path, args: argparse.Namespace, start_index: int) -> list[SlopExample]:
+    extensions = normalize_extension_filter(args.extensions)
+    examples: list[SlopExample] = []
+    for candidate in sorted(path.rglob("*")):
+        if not candidate.is_file():
+            continue
+        if should_skip_path(candidate, path, args.include_hidden):
+            continue
+        if candidate.suffix.lower() not in extensions:
+            continue
+        example = read_slop_example_file(candidate, start_index + len(examples), args)
+        if example:
+            examples.append(example)
+    return examples
+
+
+def read_slop_example_file(
+    path: Path, index: int, args: argparse.Namespace
+) -> SlopExample | None:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        print(f"Skipping unreadable slop example {path}: {exc}", file=sys.stderr)
+        return None
+    if len(data) > args.max_file_bytes:
+        print(f"Skipping oversized slop example {path}", file=sys.stderr)
+        return None
+    if is_binary(data):
+        print(f"Skipping binary slop example {path}", file=sys.stderr)
+        return None
+    text = data.decode("utf-8", errors="replace")
+    if len(text) > args.max_chars:
+        text = text[: args.max_chars]
+    return SlopExample(
+        id=f"slop-example:{index}:{sha256_bytes(data)[:12]}",
+        name=path.stem or f"example-{index}",
+        source=path.as_posix(),
+        size=len(data),
+        sha256=sha256_bytes(data),
+        text=text,
+    )
+
+
+def make_literal_slop_example(text: str, index: int) -> SlopExample:
+    encoded = text.encode("utf-8")
+    words = split_name(text[:80])
+    name = "-".join(words[:5]) if words else f"example-{index}"
+    return SlopExample(
+        id=f"slop-example:{index}:{sha256_bytes(encoded)[:12]}",
+        name=name,
+        source="literal",
+        size=len(encoded),
+        sha256=sha256_bytes(encoded),
+        text=text,
+    )
+
+
+def build_slop_example_items(examples: Sequence[SlopExample]) -> list[SemanticItem]:
+    items: list[SemanticItem] = []
+    for example in examples:
+        extension = Path(example.source).suffix.lower() or ".txt"
+        imports, calls = summarize_structure(example.text, extension)
+        items.append(
+            SemanticItem(
+                id=example.id,
+                path=example.source,
+                kind="slop-example",
+                name=example.name,
+                start_line=1,
+                end_line=line_count(example.text),
+                size=example.size,
+                sha256=example.sha256,
+                normalized_hash=normalized_source_hash(example.text),
+                extension=extension,
+                text=example.text,
+                imports=imports,
+                calls=calls,
+            )
+        )
+    return items
+
+
 def normalized_source_hash(text: str) -> str:
     normalized_lines = []
     in_block_comment = False
@@ -459,7 +637,8 @@ def normalized_source_hash(text: str) -> str:
             continue
         line = re.sub(r"\s+", " ", line)
         normalized_lines.append(line)
-    return sha256_text("\n".join(normalized_lines))
+    normalized = "\n".join(normalized_lines)
+    return sha256_text(normalized) if normalized else ""
 
 
 def item_label(item: SemanticItem) -> str:
@@ -963,6 +1142,75 @@ def duplicate_pairs(docs: Sequence[SemanticItem], threshold: float) -> list[Simi
     return pairs
 
 
+def match_slop_examples(
+    examples: Sequence[SlopExample],
+    example_items: Sequence[SemanticItem],
+    docs: Sequence[SemanticItem],
+    doc_embeddings: np.ndarray,
+    example_embeddings: np.ndarray,
+    args: argparse.Namespace,
+) -> list[SlopMatch]:
+    if not examples or not example_items:
+        return []
+
+    semantic_scores = example_embeddings @ doc_embeddings.T
+    doc_token_sets = [token_set(doc.text) for doc in docs]
+    example_token_sets = [token_set(example.text) for example in example_items]
+    example_by_id = {example.id: example for example in examples}
+    matches: list[SlopMatch] = []
+
+    for example_index, example in enumerate(example_items):
+        for doc_index, doc in enumerate(docs):
+            semantic_score = float(semantic_scores[example_index, doc_index])
+            relation = ""
+            score = semantic_score
+            evidence = ""
+
+            if example.normalized_hash and example.normalized_hash == doc.normalized_hash:
+                relation = "exact-example"
+                score = 1.0
+                evidence = "same normalized source hash as slop example"
+            else:
+                overlap = jaccard(example_token_sets[example_index], doc_token_sets[doc_index])
+                if overlap >= args.near_duplicate_threshold:
+                    relation = "near-example"
+                    score = overlap
+                    evidence = "high token-set overlap with slop example"
+                elif semantic_score >= args.slop_match_threshold:
+                    relation = "semantic-example"
+                    evidence = "embedding similarity to slop example"
+
+            if relation:
+                source = example_by_id.get(example.id)
+                matches.append(
+                    SlopMatch(
+                        example_id=example.id,
+                        example_name=source.name if source else example.name,
+                        item_id=doc.id,
+                        path=doc.path,
+                        kind=doc.kind,
+                        name=doc.name,
+                        start_line=doc.start_line,
+                        end_line=doc.end_line,
+                        similarity=score,
+                        relation=relation,
+                        evidence=evidence,
+                    )
+                )
+
+    matches.sort(key=slop_match_sort_key, reverse=True)
+    if args.slop_top_matches > 0:
+        return matches[: args.slop_top_matches]
+    return matches
+
+
+def slop_match_sort_key(match: SlopMatch) -> tuple[int, float]:
+    priority = {"exact-example": 3, "near-example": 2, "semantic-example": 1}.get(
+        match.relation, 0
+    )
+    return priority, match.similarity
+
+
 def redundant_parent_pair(a: SemanticItem, b: SemanticItem) -> bool:
     if a.path != b.path:
         return False
@@ -1179,6 +1427,8 @@ def write_report(
     root: Path,
     files: Sequence[FileDoc],
     docs: Sequence[SemanticItem],
+    slop_examples: Sequence[SlopExample],
+    slop_matches: Sequence[SlopMatch],
     provider: EmbeddingProvider,
     args: argparse.Namespace,
     pairs: Sequence[SimilarPair],
@@ -1194,9 +1444,12 @@ def write_report(
         "granularity": args.granularity,
         "threshold": args.threshold,
         "near_duplicate_threshold": args.near_duplicate_threshold,
+        "slop_match_threshold": args.slop_match_threshold,
         "file_count": len(files),
         "item_count": len(docs),
         "cluster_count": len(clusters),
+        "slop_example_count": len(slop_examples),
+        "slop_match_count": len(slop_matches),
         "files": [
             {
                 "path": doc.path,
@@ -1226,6 +1479,17 @@ def write_report(
             }
             for index, doc in enumerate(docs)
         ],
+        "slop_examples": [
+            {
+                "id": example.id,
+                "name": example.name,
+                "source": example.source,
+                "size": example.size,
+                "sha256": example.sha256,
+            }
+            for example in slop_examples
+        ],
+        "slop_matches": [asdict(match) for match in slop_matches],
         "cluster_edges": [
             asdict(pair)
             for pair in pairs
@@ -1260,6 +1524,8 @@ def write_html(
     root: Path,
     files: Sequence[FileDoc],
     docs: Sequence[SemanticItem],
+    slop_examples: Sequence[SlopExample],
+    slop_matches: Sequence[SlopMatch],
     provider: EmbeddingProvider,
     args: argparse.Namespace,
     pairs: Sequence[SimilarPair],
@@ -1338,12 +1604,38 @@ def write_html(
             "</tr>"
         )
 
+    slop_match_rows = []
+    for match in slop_matches:
+        location = f"{match.path}:{match.start_line}-{match.end_line}"
+        slop_match_rows.append(
+            "<tr>"
+            f"<td>{match.similarity:.3f}</td>"
+            f"<td>{html.escape(match.relation)}</td>"
+            f"<td>{html.escape(match.example_name)}</td>"
+            f"<td>{html.escape(location)}</td>"
+            f"<td>{html.escape(match.item_id)}</td>"
+            "</tr>"
+        )
+    if slop_examples:
+        slop_section = (
+            "<h2>Slop Example Matches</h2>"
+            "<table>"
+            "<thead><tr><th>Similarity</th><th>Kind</th><th>Example</th>"
+            "<th>Location</th><th>Item</th></tr></thead>"
+            f"<tbody>{''.join(slop_match_rows)}</tbody>"
+            "</table>"
+            if slop_match_rows
+            else "<h2>Slop Example Matches</h2><p>No code items matched the supplied slop examples.</p>"
+        )
+    else:
+        slop_section = ""
+
     content = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Anti-Slop Canon Map</title>
+  <title>Anti-Slop Cannon Map</title>
   <style>
     :root {{
       color-scheme: light;
@@ -1464,7 +1756,7 @@ def write_html(
 </head>
 <body>
   <header>
-    <h1>Anti-Slop Canon Map</h1>
+    <h1>Anti-Slop Cannon Map</h1>
     <p><code>{html.escape(str(root))}</code></p>
     <p>Provider: <code>{html.escape(provider.cache_identity())}</code></p>
   </header>
@@ -1475,6 +1767,7 @@ def write_html(
       <div class="stat"><strong>{len(clusters)}</strong><span>clusters above threshold</span></div>
       <div class="stat"><strong>{args.threshold:.2f}</strong><span>similarity threshold</span></div>
       <div class="stat"><strong>{sum(1 for pair in pairs if pair.relation != 'semantic' or pair.similarity >= args.threshold)}</strong><span>overlap edges</span></div>
+      <div class="stat"><strong>{len(slop_matches)}</strong><span>slop example matches</span></div>
     </div>
     <h2>Map</h2>
     <div class="map">
@@ -1494,6 +1787,7 @@ def write_html(
         {''.join(top_pair_rows)}
       </tbody>
     </table>
+    {slop_section}
     <h2>Clusters</h2>
     {''.join(cluster_sections) if cluster_sections else '<p>No clusters crossed the selected threshold.</p>'}
   </main>
@@ -1609,6 +1903,8 @@ def parse_json_object(text: str) -> dict[str, object]:
 def print_summary(
     files: Sequence[FileDoc],
     docs: Sequence[SemanticItem],
+    slop_examples: Sequence[SlopExample],
+    slop_matches: Sequence[SlopMatch],
     pairs: Sequence[SimilarPair],
     clusters: Sequence[Cluster],
     args: argparse.Namespace,
@@ -1619,8 +1915,20 @@ def print_summary(
     print(f"Scanned files: {len(files)}")
     print(f"Embedded items: {len(docs)}")
     print(f"Clusters above {args.threshold:.2f}: {len(clusters)}")
+    if slop_examples:
+        print(f"Slop examples: {len(slop_examples)}")
+        print(f"Slop matches above {args.slop_match_threshold:.2f}: {len(slop_matches)}")
     print(f"Report: {report_path}")
     print(f"Map: {html_path}")
+    if slop_matches:
+        print()
+        print("Top slop example matches:")
+        for match in slop_matches[:10]:
+            location = f"{match.path}:{match.start_line}-{match.end_line}"
+            print(
+                f"  {match.relation:16} {match.similarity:.3f}  "
+                f"{match.example_name}  ->  {location}"
+            )
     if clusters:
         print()
         print("Largest clusters:")
@@ -1651,6 +1959,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 0 <= args.near_duplicate_threshold <= 1:
         print("--near-duplicate-threshold must be between 0 and 1", file=sys.stderr)
         return 2
+    if not 0 <= args.slop_match_threshold <= 1:
+        print("--slop-match-threshold must be between 0 and 1", file=sys.stderr)
+        return 2
+    if args.slop_top_matches < 0:
+        print("--slop-top-matches must be zero or greater", file=sys.stderr)
+        return 2
 
     provider = make_provider(args)
     files = scan_files(args)
@@ -1661,21 +1975,59 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not docs:
         print("No eligible files, symbols, or chunks found.", file=sys.stderr)
         return 1
+    slop_examples = load_slop_examples(args, root)
+    slop_items = build_slop_example_items(slop_examples)
 
     print(f"Scanning root: {root}")
     print(f"Eligible files: {len(files)}")
     print(f"Embedding granularity: {args.granularity} ({len(docs)} items)")
-    embeddings = get_embeddings(docs, provider, args)
+    if slop_examples:
+        print(f"Slop examples: {len(slop_examples)}")
+    all_embeddings = get_embeddings([*docs, *slop_items], provider, args)
+    embeddings = all_embeddings[: len(docs)]
+    slop_embeddings = all_embeddings[len(docs) :]
     _, semantic_pairs = cosine_pairs(docs, embeddings)
     duplicate_edges = duplicate_pairs(docs, args.near_duplicate_threshold)
     pairs = merge_pairs(semantic_pairs, duplicate_edges)
     clusters = build_clusters(docs, semantic_pairs, duplicate_edges, args.threshold)
+    slop_matches = match_slop_examples(
+        slop_examples,
+        slop_items,
+        docs,
+        embeddings,
+        slop_embeddings,
+        args,
+    )
     maybe_label_clusters_with_llm(clusters, docs, args)
     coords = pca_2d(embeddings)
     output_dir = Path(args.output_dir).expanduser().resolve()
-    report_path = write_report(output_dir, root, files, docs, provider, args, pairs, clusters, coords)
-    html_path = write_html(output_dir, root, files, docs, provider, args, pairs, clusters, coords)
-    print_summary(files, docs, pairs, clusters, args, report_path, html_path)
+    report_path = write_report(
+        output_dir,
+        root,
+        files,
+        docs,
+        slop_examples,
+        slop_matches,
+        provider,
+        args,
+        pairs,
+        clusters,
+        coords,
+    )
+    html_path = write_html(
+        output_dir,
+        root,
+        files,
+        docs,
+        slop_examples,
+        slop_matches,
+        provider,
+        args,
+        pairs,
+        clusters,
+        coords,
+    )
+    print_summary(files, docs, slop_examples, slop_matches, pairs, clusters, args, report_path, html_path)
     return 0
 
 

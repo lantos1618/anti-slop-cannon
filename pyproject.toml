@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "anti-slop-canon"
+name = "anti-slop-cannon"
 version = "0.1.0"
 description = "Semantic clustering map for spotting repeated or overlapping files in a codebase."
 readme = "README.md"
@@ -22,7 +22,7 @@ local = [
 ]
 
 [project.scripts]
-anti-slop-canon = "anti_slop_canon:main"
+anti-slop-cannon = "anti_slop_cannon:main"
 
 [tool.setuptools]
-py-modules = ["anti_slop_canon"]
+py-modules = ["anti_slop_cannon"]

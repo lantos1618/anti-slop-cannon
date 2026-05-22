@@ -1,11 +1,11 @@
-# Anti-Slop Canon
+# Anti-Slop Cannon
 
 Visualize a codebase as semantic clusters so repeated or overlapping implementation
 responsibilities stand out.
 
 The script scans text/code files, extracts functions/classes/chunks, embeds each item,
 adds exact and near-duplicate evidence, builds connected clusters above a threshold,
-and writes:
+optionally matches supplied slop examples against the codebase, and writes:
 
 - `anti_slop_report.json`: machine-readable files, pairs, clusters, and model settings
 - `anti_slop_map.html`: a static browser visualization of the codebase
@@ -53,7 +53,7 @@ For Google embeddings:
 
 ```bash
 export GEMINI_API_KEY=...
-python anti_slop_canon.py /path/to/code \
+anti-slop-cannon /path/to/code \
   --provider google \
   --model gemini-embedding-2 \
   --output-dim 3072
@@ -63,7 +63,7 @@ For best open-weight local Qwen embeddings:
 
 ```bash
 pip install -e ".[local]"
-python anti_slop_canon.py /path/to/code \
+anti-slop-cannon /path/to/code \
   --provider sentence-transformers \
   --model Qwen/Qwen3-Embedding-8B \
   --output-dim 4096
@@ -73,7 +73,7 @@ For OpenAI embeddings:
 
 ```bash
 export OPENAI_API_KEY=...
-python anti_slop_canon.py /path/to/code \
+anti-slop-cannon /path/to/code \
   --provider openai \
   --model text-embedding-3-large \
   --output-dim 3072
@@ -82,7 +82,7 @@ python anti_slop_canon.py /path/to/code \
 For a no-API smoke test:
 
 ```bash
-python anti_slop_canon.py . --provider hash --output-dir .anti-slop-out
+anti-slop-cannon . --provider hash --output-dir .anti-slop-out
 ```
 
 The hash provider is only a cheap lexical fallback. It is useful for checking the
@@ -91,7 +91,7 @@ pipeline, but it is not a replacement for semantic embeddings.
 ## Usage
 
 ```bash
-python anti_slop_canon.py /path/to/code \
+anti-slop-cannon /path/to/code \
   --provider google \
   --model gemini-embedding-2 \
   --output-dim 3072 \
@@ -101,9 +101,24 @@ python anti_slop_canon.py /path/to/code \
   --output-dir anti-slop-output
 ```
 
+Run with examples of slop you already know about:
+
+```bash
+anti-slop-cannon /path/to/code \
+  --provider google \
+  --slop-example examples/copy_paste_cache.py \
+  --slop-example "manual JSON string building with regex parsing" \
+  --slop-examples-dir examples/slop-patterns \
+  --slop-match-threshold 0.74
+```
+
+Examples can be literal text, individual files, or directories of files. Matches are
+written to `slop_examples` and `slop_matches` in `anti_slop_report.json` and shown in
+the HTML report.
+
 ## Clustering Method
 
-Anti-Slop Canon clusters an evidence graph:
+Anti-Slop Cannon clusters an evidence graph:
 
 1. Extract analysis items from each file:
    - Python uses `ast` to extract classes, functions, and methods.
@@ -115,13 +130,18 @@ Anti-Slop Canon clusters an evidence graph:
 5. Add a near edge when token-set overlap is above `--near-duplicate-threshold`.
 6. Build connected components over those edges.
 7. Label each cluster from symbol names, paths, shared imports, and shared calls.
-8. Emit review recommendations. The tool never deletes code or treats clusters as proof.
+8. Match supplied slop examples against the embedded code items.
+9. Emit review recommendations. The tool never deletes code or treats clusters as proof.
 
 Useful flags:
 
 - `--threshold`: similarity cutoff for duplicate/overlap edges
 - `--near-duplicate-threshold`: token-overlap cutoff for near-duplicate evidence
 - `--granularity`: `symbol` for functions/classes/chunks, `file` for whole files, `both` for comparison
+- `--slop-example`: literal text or a file path to match against the codebase
+- `--slop-examples-dir`: directory of example snippets/files to match against the codebase
+- `--slop-match-threshold`: similarity cutoff for example-to-code matches
+- `--slop-top-matches`: maximum example matches to emit, or `0` for all matches
 - `--llm-labels`: optionally ask a Google/OpenAI LLM to label clusters and write review notes
 - `--min-symbol-lines`, `--min-symbol-chars`: suppress tiny symbols
 - `--chunk-lines`, `--chunk-overlap`: control fallback chunks
