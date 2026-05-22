@@ -864,12 +864,13 @@ class GoogleProvider(EmbeddingProvider):
                 "Missing dependency: install google-genai or run `pip install -e .`."
             ) from exc
 
-        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
             raise SystemExit(
                 "Set GEMINI_API_KEY or GOOGLE_API_KEY, or use `--provider hash` for a smoke test."
             )
 
-        client = genai.Client()
+        client = genai.Client(api_key=api_key)
         vectors: list[list[float]] = []
         for index, text in enumerate(texts, start=1):
             content = self._format_text(text)
@@ -909,9 +910,10 @@ class OpenAIProvider(EmbeddingProvider):
             from openai import OpenAI
         except ImportError as exc:
             raise SystemExit("Missing dependency: install openai or run `pip install -e .`.") from exc
-        if not os.getenv("OPENAI_API_KEY"):
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
             raise SystemExit("Set OPENAI_API_KEY, or use `--provider hash` for a smoke test.")
-        client = OpenAI()
+        client = OpenAI(api_key=api_key)
         response = client.embeddings.create(
             model=self.model,
             input=list(texts),
@@ -1859,9 +1861,10 @@ def request_cluster_label(prompt: str, args: argparse.Namespace) -> tuple[str, s
             from google import genai
         except ImportError as exc:
             raise RuntimeError("install google-genai for Google LLM labels") from exc
-        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
+        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
             raise RuntimeError("set GEMINI_API_KEY or GOOGLE_API_KEY for Google LLM labels")
-        client = genai.Client()
+        client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model=args.llm_model or "gemini-2.5-flash",
             contents=prompt,
@@ -1872,9 +1875,10 @@ def request_cluster_label(prompt: str, args: argparse.Namespace) -> tuple[str, s
             from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError("install openai for OpenAI LLM labels") from exc
-        if not os.getenv("OPENAI_API_KEY"):
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
             raise RuntimeError("set OPENAI_API_KEY for OpenAI LLM labels")
-        client = OpenAI()
+        client = OpenAI(api_key=api_key)
         response = client.responses.create(
             model=args.llm_model or "gpt-5-mini",
             input=prompt,

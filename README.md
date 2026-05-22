@@ -154,3 +154,23 @@ Useful flags:
 Open the generated `anti_slop_map.html` in a browser. Dense clusters and high-similarity
 pairs are the first places to inspect for repeated responsibilities, duplicated
 implementations, and files that may want consolidation.
+
+## Evals
+
+Run the deterministic fixture eval with no API key:
+
+```bash
+python evals/run_evals.py --provider hash
+```
+
+For hosted embeddings, put the key in `.env` or export it in the shell. The eval runner
+loads `.env` and does not print key values.
+
+```bash
+GEMINI_API_KEY=... python evals/run_evals.py --provider google --keep-output
+OPENAI_API_KEY=... python evals/run_evals.py --provider openai --keep-output
+```
+
+The eval fixture expects the cannon to find a duplicated `parse_total_rows`
+implementation, produce at least one cluster, and match the supplied slop example
+against both duplicated files.
