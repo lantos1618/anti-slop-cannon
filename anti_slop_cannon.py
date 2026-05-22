@@ -250,6 +250,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Truncate each file to this many decoded characters before embedding.",
     )
     parser.add_argument(
+        "--max-items",
+        type=int,
+        default=0,
+        help="Maximum analysis items to embed after extraction. Use 0 for no cap.",
+    )
+    parser.add_argument(
         "--min-symbol-lines",
         type=int,
         default=4,
@@ -299,6 +305,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=40,
         help="Number of high-similarity pairs to show in CLI output and HTML.",
+    )
+    parser.add_argument(
+        "--max-common-token-ratio",
+        type=float,
+        default=0.40,
+        help=(
+            "Ignore tokens appearing in more than this fraction of items when "
+            "building near-duplicate candidates. Use 1.0 to index every token."
+        ),
+    )
+    parser.add_argument(
+        "--max-near-candidates-per-item",
+        type=int,
+        default=2000,
+        help=(
+            "Maximum near-duplicate candidates to score per item after token-index "
+            "candidate generation. Use 0 for no cap."
+        ),
     )
     parser.add_argument(
         "--slop-example",
@@ -1106,27 +1130,64 @@ def normalize_matrix(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def cosine_pairs(docs: Sequence[SemanticItem], embeddings: np.ndarray) -> tuple[np.ndarray, list[SimilarPair]]:
+def cosine_pairs(
+    docs: Sequence[SemanticItem],
+    embeddings: np.ndarray,
+    threshold: float,
+    top_limit: int,
+) -> tuple[list[SimilarPair], dict[str, int]]:
     similarity = embeddings @ embeddings.T
-    pairs: list[SimilarPair] = []
+    pairs_by_key: dict[tuple[str, str, str], SimilarPair] = {}
+    top_candidates: list[tuple[float, int, int]] = []
+    scored_pairs = 0
+    redundant_pairs = 0
     for i in range(len(docs)):
         for j in range(i + 1, len(docs)):
             if redundant_parent_pair(docs[i], docs[j]):
+                redundant_pairs += 1
                 continue
-            pairs.append(
-                SimilarPair(
+            scored_pairs += 1
+            score = float(similarity[i, j])
+            if score >= threshold:
+                pair = SimilarPair(
                     a=docs[i].id,
                     b=docs[j].id,
-                    similarity=float(similarity[i, j]),
+                    similarity=score,
                     relation="semantic",
                     evidence="embedding cosine similarity",
                 )
+                pairs_by_key[pair_key(pair.a, pair.b, pair.relation)] = pair
+            if top_limit > 0:
+                top_candidates.append((score, i, j))
+                if len(top_candidates) > top_limit * 4:
+                    top_candidates.sort(reverse=True)
+                    del top_candidates[top_limit:]
+    if top_limit > 0:
+        top_candidates.sort(reverse=True)
+        for score, i, j in top_candidates[:top_limit]:
+            pair = SimilarPair(
+                a=docs[i].id,
+                b=docs[j].id,
+                similarity=score,
+                relation="semantic",
+                evidence="embedding cosine similarity",
             )
+            pairs_by_key.setdefault(pair_key(pair.a, pair.b, pair.relation), pair)
+    pairs = list(pairs_by_key.values())
     pairs.sort(key=lambda pair: pair.similarity, reverse=True)
-    return similarity, pairs
+    return pairs, {
+        "semantic_pairs_scored": scored_pairs,
+        "semantic_pairs_redundant": redundant_pairs,
+        "semantic_pairs_retained": len(pairs),
+    }
 
 
-def duplicate_pairs(docs: Sequence[SemanticItem], threshold: float) -> list[SimilarPair]:
+def duplicate_pairs(
+    docs: Sequence[SemanticItem],
+    threshold: float,
+    max_common_token_ratio: float,
+    max_near_candidates_per_item: int,
+) -> tuple[list[SimilarPair], dict[str, int]]:
     pairs: list[SimilarPair] = []
     hash_groups: dict[str, list[SemanticItem]] = {}
     for doc in docs:
@@ -1153,10 +1214,33 @@ def duplicate_pairs(docs: Sequence[SemanticItem], threshold: float) -> list[Simi
                 )
 
     token_sets = [token_set(doc.text) for doc in docs]
+    eligible_indices = [index for index, tokens in enumerate(token_sets) if len(tokens) >= 18]
+    token_counts: Counter[str] = Counter()
+    for index in eligible_indices:
+        token_counts.update(token_sets[index])
+    max_common_count = max(2, math.ceil(len(eligible_indices) * max_common_token_ratio))
+    common_tokens = {token for token, count in token_counts.items() if count > max_common_count}
+    token_index: dict[str, list[int]] = {}
+    for index in eligible_indices:
+        for token in token_sets[index] - common_tokens:
+            token_index.setdefault(token, []).append(index)
+
+    candidate_checks = 0
+    candidate_pairs = 0
+    capped_items = 0
     for i in range(len(docs)):
         if len(token_sets[i]) < 18:
             continue
-        for j in range(i + 1, len(docs)):
+        candidate_counts: Counter[int] = Counter()
+        for token in token_sets[i] - common_tokens:
+            for j in token_index.get(token, []):
+                if j > i:
+                    candidate_counts[j] += 1
+        if max_near_candidates_per_item > 0 and len(candidate_counts) > max_near_candidates_per_item:
+            candidate_counts = Counter(dict(candidate_counts.most_common(max_near_candidates_per_item)))
+            capped_items += 1
+        candidate_pairs += len(candidate_counts)
+        for j in candidate_counts:
             if redundant_parent_pair(docs[i], docs[j]):
                 continue
             if len(token_sets[j]) < 18:
@@ -1164,6 +1248,7 @@ def duplicate_pairs(docs: Sequence[SemanticItem], threshold: float) -> list[Simi
             key = pair_key(docs[i].id, docs[j].id, "near")
             if key in seen:
                 continue
+            candidate_checks += 1
             score = jaccard(token_sets[i], token_sets[j])
             if score >= threshold:
                 pairs.append(
@@ -1176,7 +1261,12 @@ def duplicate_pairs(docs: Sequence[SemanticItem], threshold: float) -> list[Simi
                     )
                 )
     pairs.sort(key=lambda pair: (pair.relation == "exact", pair.similarity), reverse=True)
-    return pairs
+    return pairs, {
+        "near_duplicate_candidate_pairs": candidate_pairs,
+        "near_duplicate_candidate_checks": candidate_checks,
+        "near_duplicate_common_tokens_skipped": len(common_tokens),
+        "near_duplicate_capped_items": capped_items,
+    }
 
 
 def match_slop_examples(
@@ -1471,6 +1561,7 @@ def write_report(
     pairs: Sequence[SimilarPair],
     clusters: Sequence[Cluster],
     coords: np.ndarray,
+    analysis_stats: dict[str, int],
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "anti_slop_report.json"
@@ -1487,6 +1578,12 @@ def write_report(
         "cluster_count": len(clusters),
         "slop_example_count": len(slop_examples),
         "slop_match_count": len(slop_matches),
+        "analysis_stats": analysis_stats,
+        "scan_limits": {
+            "max_items": args.max_items,
+            "max_common_token_ratio": args.max_common_token_ratio,
+            "max_near_candidates_per_item": args.max_near_candidates_per_item,
+        },
         "files": [
             {
                 "path": doc.path,
@@ -1998,6 +2095,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 0 <= args.near_duplicate_threshold <= 1:
         print("--near-duplicate-threshold must be between 0 and 1", file=sys.stderr)
         return 2
+    if not 0 <= args.max_common_token_ratio <= 1:
+        print("--max-common-token-ratio must be between 0 and 1", file=sys.stderr)
+        return 2
+    if args.max_items < 0:
+        print("--max-items must be zero or greater", file=sys.stderr)
+        return 2
+    if args.max_near_candidates_per_item < 0:
+        print("--max-near-candidates-per-item must be zero or greater", file=sys.stderr)
+        return 2
     if not 0 <= args.slop_match_threshold <= 1:
         print("--slop-match-threshold must be between 0 and 1", file=sys.stderr)
         return 2
@@ -2014,6 +2120,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not docs:
         print("No eligible files, symbols, or chunks found.", file=sys.stderr)
         return 1
+    extracted_item_count = len(docs)
+    if args.max_items and len(docs) > args.max_items:
+        docs = docs[: args.max_items]
+        print(f"Limiting analysis items: {len(docs)} of {extracted_item_count} extracted.")
     slop_examples = load_slop_examples(args, root)
     slop_items = build_slop_example_items(slop_examples)
 
@@ -2025,8 +2135,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     all_embeddings = get_embeddings([*docs, *slop_items], provider, args)
     embeddings = all_embeddings[: len(docs)]
     slop_embeddings = all_embeddings[len(docs) :]
-    _, semantic_pairs = cosine_pairs(docs, embeddings)
-    duplicate_edges = duplicate_pairs(docs, args.near_duplicate_threshold)
+    semantic_pairs, semantic_stats = cosine_pairs(docs, embeddings, args.threshold, args.top_pairs)
+    duplicate_edges, duplicate_stats = duplicate_pairs(
+        docs,
+        args.near_duplicate_threshold,
+        args.max_common_token_ratio,
+        args.max_near_candidates_per_item,
+    )
+    analysis_stats = {
+        "extracted_item_count": extracted_item_count,
+        **semantic_stats,
+        **duplicate_stats,
+    }
     pairs = merge_pairs(semantic_pairs, duplicate_edges)
     clusters = build_clusters(docs, semantic_pairs, duplicate_edges, args.threshold)
     slop_matches = match_slop_examples(
@@ -2052,6 +2172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pairs,
         clusters,
         coords,
+        analysis_stats,
     )
     html_path = write_html(
         output_dir,

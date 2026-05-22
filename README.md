@@ -152,11 +152,14 @@ Useful flags:
 - `--slop-examples-dir`: directory of example snippets/files to match against the codebase
 - `--slop-match-threshold`: similarity cutoff for example-to-code matches
 - `--slop-top-matches`: maximum example matches to emit, or `0` for all matches
+- `--max-common-token-ratio`: skip overly common tokens when finding near-duplicate candidates
+- `--max-near-candidates-per-item`: cap near-duplicate candidate scoring per item for large repos
 - `--llm-labels`: optionally ask a Google/OpenAI LLM to label clusters and write review notes
 - `--min-symbol-lines`, `--min-symbol-chars`: suppress tiny symbols
 - `--chunk-lines`, `--chunk-overlap`: control fallback chunks
 - `--max-file-bytes`: skip files above this size
 - `--max-chars`: truncate each file before embedding
+- `--max-items`: cap extracted items for very large or exploratory scans
 - `--include-hidden`: include hidden files/directories
 - `--extensions`: comma-separated extension allowlist, for example `.py,.ts,.tsx,.md`
 - `--cache-path`: reuse unchanged embeddings across runs
@@ -164,6 +167,12 @@ Useful flags:
 Open the generated `anti_slop_map.html` in a browser. Dense clusters and high-similarity
 pairs are the first places to inspect for repeated responsibilities, duplicated
 implementations, and files that may want consolidation.
+
+For large repos, start with `--granularity symbol`, keep generated/vendor directories
+excluded, and use `--max-items` for an exploratory first pass. Tune
+`--max-near-candidates-per-item` downward if the near-duplicate pass is still too broad.
+The JSON report includes `analysis_stats` and `scan_limits` so scan cost and candidate
+pruning are visible.
 
 ## Evals
 
