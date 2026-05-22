@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anti-slop-canon"
+version = "0.1.0"
+description = "Semantic clustering map for spotting repeated or overlapping files in a codebase."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "google-genai>=1.0.0",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+local = [
+  "sentence-transformers>=2.7.0",
+  "torch",
+  "transformers>=4.51.0",
+]
+
+[project.scripts]
+anti-slop-canon = "anti_slop_canon:main"
+
+[tool.setuptools]
+py-modules = ["anti_slop_canon"]

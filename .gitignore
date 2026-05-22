@@ -1,0 +1,10 @@
+.anti-slop-cache/
+.anti-slop-out/
+.env
+.venv/
+__pycache__/
+*.pyc
+
+anti_slop_report.json
+anti_slop_map.html
+
