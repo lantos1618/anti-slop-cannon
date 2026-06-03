@@ -43,7 +43,7 @@ Primary references:
 ## Install
 
 ```bash
-cd /home/ubuntu/anti-slop
+cd /home/ubuntu/anti-slop-cannon
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
